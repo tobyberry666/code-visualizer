@@ -1,0 +1,36 @@
+{
+  "name": "code-visualier",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "中文友好、丝滑动画、粘贴代码自动识别语言并可视化的在线平台",
+  "license": "MIT",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "fetch-pyodide": "node scripts/fetch-pyodide.mjs"
+  },
+  "dependencies": {
+    "@codemirror/commands": "^6.6.0",
+    "@codemirror/lang-javascript": "^6.2.2",
+    "@codemirror/lang-python": "^6.1.6",
+    "@codemirror/language": "^6.10.1",
+    "@codemirror/state": "^6.4.1",
+    "@codemirror/view": "^6.28.0",
+    "codemirror": "^6.0.1",
+    "pixi.js": "^8.2.6",
+    "pyodide": "^0.26.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "playwright-core": "^1.61.1",
+    "typescript": "^5.5.3",
+    "vite": "^5.3.3"
+  }
+}
