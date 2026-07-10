@@ -292,9 +292,15 @@ function normCFamilyLine(line: string, nodeClasses: Set<string>): string {
     }
   );
   // 小写自定义类型单变量指针：node *head; → var head;
-  s = s.replace(/^\s*([a-z]\w+)\s*\*\s*(\w+)\s*[=;]/, "var $2;");
+  s = s.replace(/^\s*([a-z]\w+)\s*\*\s*(\w+)\s*[=;]/, (_m, tp, v) => {
+    if (TYPE_WORDS.includes(tp) || /^(?:let|var|const|if|else|for|while|do|switch|case|return|break|continue|function|class|new|delete|typeof|instanceof|void|throw|try|catch|finally)$/.test(tp)) return _m;
+    return "var " + v + ";";
+  });
   // 小写自定义类型无指针：node head; → var head;
-  s = s.replace(/^\s*([a-z]\w+)\s+(\w+)\s*[=;]/, "var $2;");
+  s = s.replace(/^\s*([a-z]\w+)\s+(\w+)\s*[=;]/, (_m, tp, v) => {
+    if (TYPE_WORDS.includes(tp) || /^(?:let|var|const|if|else|for|while|do|switch|case|return|break|continue|function|class|new|delete|typeof|instanceof|void|throw|try|catch|finally)$/.test(tp)) return _m;
+    return "var " + v + ";";
+  });
 
   // 函数定义
   s = s.replace(
