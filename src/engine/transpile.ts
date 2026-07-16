@@ -74,6 +74,16 @@ function stripComments(code: string, lang: Lang): string[] {
   return out;
 }
 
+/** 把 Python f-string（f"..." / f'...'）转成 JS 模板字符串，避免翻成非法 JS。 */
+function convertFString(line: string): string {
+  return line.replace(/(f)(["'])([\s\S]*?)\2/g, (_m, _f, _q, body) => {
+    let t = body.replace(/\{\{/g, "\x01").replace(/\}\}/g, "\x02");
+    t = t.replace(/\{([^{}]*)\}/g, (_x: string, expr: string) => "${" + expr + "}");
+    t = t.replace(/\x01/g, "{").replace(/\x02/g, "}");
+    return "`" + t + "`";
+  });
+}
+
 /** 收集变量名（声明/赋值/循环变量/函数参数），用于快照。 */
 function collectNames(lines: string[]): Set<string> {
   const names = new Set<string>();
@@ -198,6 +208,17 @@ function pythonToJSish(srcLines: string[]): { lines: string[]; nodeClasses: Set<
     }
 
     let s = line;
+    // 0) f-string 先转，避免 {expr} 被后续括号统计误伤
+    s = convertFString(s);
+    // 1) 字典/集合字面量（必须在 range/for 之前处理，避免 { } 被当成块）
+    //    字典 {k: v, ...} -> 对象；集合 {a, b, ...} -> new Set([...])
+    s = s.replace(/=\s*\{([^}]*:[^}]*)\}/g, "= ({$1})");
+    s = s.replace(/=\s*\{([^}]*)\}/g, "= new Set([$1])");
+    // 2) 推导式（集合/字典）暂不展开，整行跳过以免产生非法 JS
+    if (/\bfor\b.*\bin\b/.test(s) && /[{}]/.test(s)) {
+      out.push("/* comprehension skipped: " + line + " */");
+      continue;
+    }
     // 内置翻译
     s = s.replace(/len\(([^)]+)\)/g, "($1).length");
     s = s.replace(/\.append\(/g, ".push(");
@@ -210,7 +231,20 @@ function pythonToJSish(srcLines: string[]): { lines: string[]; nodeClasses: Set<
       out.push(`var ${t} = ${swap[1]}; ${swap[1]} = ${swap[3]}; ${swap[2]} = ${t};`);
       continue;
     }
-    let fm = s.match(/^for\s+(\w+)\s+in\s+range\((.*)\)\s*:$/);
+    // for X in range(...): 同行 body（如 for i in range(n): a[i] = 0）
+    let fm = s.match(/^for\s+(\w+)\s+in\s+range\((.*)\)\s*:\s*(.+)$/);
+    if (fm) {
+      const v = fm[1];
+      const args = fm[2].split(",").map((x) => x.trim());
+      let start = "0", end = "0", step = "1";
+      if (args.length === 1) end = args[0];
+      else if (args.length === 2) { start = args[0]; end = args[1]; }
+      else if (args.length >= 3) { start = args[0]; end = args[1]; step = args[2]; }
+      const body = fm[3].replace(/;?\s*$/, ";");
+      out.push(`for (var ${v} = ${start}; ${v} < ${end}; ${v} += ${step}) { ${body} }`);
+      continue;
+    }
+    fm = s.match(/^for\s+(\w+)\s+in\s+range\((.*)\)\s*:$/);
     if (fm) {
       const v = fm[1];
       const args = fm[2].split(",").map((x) => x.trim());
@@ -222,8 +256,14 @@ function pythonToJSish(srcLines: string[]): { lines: string[]; nodeClasses: Set<
       indentStack.push(indent + 1);
       continue;
     }
+    // for X in Y: 兼容数组(遍历元素)与字典/对象(遍历键)
     fm = s.match(/^for\s+(\w+)\s+in\s+(\w+)\s*:$/);
-    if (fm) { out.push(`for (var ${fm[1]} of ${fm[2]}) {`); indentStack.push(indent + 1); continue; }
+    if (fm) {
+      const iter = `(typeof ${fm[2]} === 'object' && !Array.isArray(${fm[2]}) ? Object.keys(${fm[2]}) : ${fm[2]})`;
+      out.push(`for (var ${fm[1]} of ${iter}) {`);
+      indentStack.push(indent + 1);
+      continue;
+    }
     const wm = s.match(/^while\s+(.*?)\s*:$/);
     if (wm) { out.push(`while (${wm[1]}) {`); indentStack.push(indent + 1); continue; }
     const im = s.match(/^if\s+(.*?)\s*:$/);
@@ -245,7 +285,20 @@ function pythonToJSish(srcLines: string[]): { lines: string[]; nodeClasses: Set<
 
 function balanceBraces(lines: string[]): string[] {
   let open = 0;
-  for (const l of lines) for (const c of l) { if (c === "{") open++; else if (c === "}") open--; }
+  for (const l of lines) {
+    let inStr: string | null = null;
+    for (let i = 0; i < l.length; i++) {
+      const c = l[i];
+      if (inStr) {
+        if (c === "\\") { i++; continue; }
+        if (c === inStr) inStr = null;
+        continue;
+      }
+      if (c === '"' || c === "'" || c === "`") { inStr = c; continue; }
+      if (c === "{") open++;
+      else if (c === "}") open--;
+    }
+  }
   const res = lines.slice();
   for (let i = 0; i < Math.max(0, open); i++) res.push("}");
   return res;
@@ -264,6 +317,11 @@ function normCFamilyLine(line: string, nodeClasses: Set<string>): string {
   s = s.replace(/^\s*#\w+.*$/g, "/* pp skipped */");
   // using namespace std; 整行跳过
   s = s.replace(/^\s*using\b.*$/g, "/* using skipped */");
+  // Java import / package 整行跳过
+  s = s.replace(/^\s*import\b.*$/g, "/* import skipped */");
+  s = s.replace(/^\s*package\b.*$/g, "/* package skipped */");
+  // Java class 声明行（含 extends/implements）整行跳过，避免类包裹的 { } 干扰块结构
+  s = s.replace(/^\s*(?:public\s+|final\s+|abstract\s+|static\s+)*class\s+[\w<>,.\s]*\{?\s*$/g, "/* class skipped */");
 
   // 跳过整行结构体/类/联合定义（教学子集不展开成员，避免把成员当语句执行）
   s = s.replace(/^\s*(?:typedef\s+)?(?:struct|class|union)\s+\w*\s*\{[^}]*\}\s*\w*\s*;?\s*$/, "/* struct skipped */");
@@ -306,7 +364,7 @@ function normCFamilyLine(line: string, nodeClasses: Set<string>): string {
   s = s.replace(
     new RegExp("\\b(?:" + TYPE_WORDS.join("|") + "|struct\\s+\\w+)s*\\*?\\s*([A-Za-z_$][\\w$]*)\\s*\\(([^)]*)\\)\\s*\\{?"),
     (_m, name, params) => {
-      const ps = params.split(",").map((p: string) => p.replace(new RegExp("(?:" + TYPE_WORDS.join("|") + ")"), "").replace(/[&*]+/g, "").replace(/=.*$/, "").trim()).filter(Boolean).join(", ");
+      const ps = params.split(",").map((p: string) => p.replace(new RegExp("(?:" + TYPE_WORDS.join("|") + ")"), "").replace(/[&*]+/g, "").replace(/\[\s*\]/g, "").replace(/=.*$/, "").trim()).filter(Boolean).join(", ");
       return `function ${name}(${ps}) {`;
     }
   );
@@ -314,6 +372,8 @@ function normCFamilyLine(line: string, nodeClasses: Set<string>): string {
   // 数组字面量声明
   s = s.replace(/\b\w+\s*\[\s*\]\s*(\w+)\s*=\s*\{([^}]*)\}/g, "var $1 = [$2]");
   s = s.replace(/\b\w+\s+(\w+)\s*\[\s*\]\s*=\s*\{([^}]*)\}/g, "var $1 = [$2]");
+  // 无类型前缀的数组声明：arr[5] = {1,2,3}; -> arr = [1,2,3];
+  s = s.replace(/\b([A-Za-z_]\w*)\s*\[\s*\w*\s*\]\s*=\s*\{([^}]*)\}/g, "$1 = [$2]");
   s = s.replace(/new\s+\w+\s*\[\s*\]\s*\{([^}]*)\}/g, "[$1]");
   // 二维数组字面量：int adj[3][3] = { {0,1,1}, ... } -> var adj = [[0,1,1], ...]
   s = s.replace(
@@ -339,7 +399,13 @@ function normCFamilyLine(line: string, nodeClasses: Set<string>): string {
   // & 地址符（scanf/函数参数中的 &var -> var）
   s = s.replace(/&([A-Za-z_$][\w$]*)/g, "$1");
 
-  // 通用容器类型
+  // 标准库容器类型（vector/map/set/...）声明：剥离 <...> 并给合理初值，避免留下 vector<> 这类非法片段
+  s = s.replace(/\b(?:vector|list|deque|forward_list)\s*<[^>]*>\s*(\w+)\s*=\s*\{([^}]*)\}/g, "var $1 = [$2]");
+  s = s.replace(/\b(?:vector|list|deque|forward_list)\s*<[^>]*>\s*(\w+)\s*\(([^)]*)\)/g, "var $1 = new Array($2 || 0).fill(0)");
+  s = s.replace(/\b(?:vector|list|deque|forward_list)\s*<[^>]*>\s*(\w+)\s*[=;]/g, "var $1 = []");
+  s = s.replace(/\b(?:map|multimap|unordered_map)\s*<[^>]*>\s*(\w+)\s*=\s*\{([^}]*)\}/g, "var $1 = {$2}");
+  s = s.replace(/\b(?:map|multimap|unordered_map|set|multiset|unordered_set|stack|queue|priority_queue)\s*<[^>]*>\s*(\w+)\s*[=;]/g, "var $1 = {}");
+  // 通用容器类型（首字母大写，Java 风格）
   s = s.replace(/\b(?:ArrayList|List|Set|Map|Deque|Queue|Stack|HashMap|Vector|PriorityQueue|LinkedList)\s*<[^>]*>\s*/g, "");
   s = s.replace(/\b[A-Z]\w*\s*<[^>]*>\s*/g, "");
   s = s.replace(/vector\s*<[^>]*>\s*(\w+)\s*\(([^)]*)\)/g, "var $1 = new Array($2 || 0).fill(0)");
@@ -412,8 +478,8 @@ function collapseMultilineDefs(lines: string[]): string[] {
   let i = 0;
   while (i < lines.length) {
     const l = lines[i];
-    // 匹配 struct/class/union 开头（可能带 typedef）
-    if (/^\s*(?:typedef\s+)?(?:struct|class|union)\b/.test(l)) {
+    // 匹配 struct/union 开头（可能带 typedef）；class 不折叠，保持多行由逐行跳过处理（Java）
+    if (/^\s*(?:typedef\s+)?(?:struct|union)\b/.test(l)) {
       // 收集从 { 到匹配的 } 的所有行
       let braceDepth = 0;
       let combined = "";
@@ -437,37 +503,38 @@ function collapseMultilineDefs(lines: string[]): string[] {
   return out;
 }
 
-/** 如果代码有 int main()/void main()，提取函数体作为顶层代码。 */
+/** 如果代码有 int main()/void main()/public static void main()，提取函数体作为顶层代码。 */
 function extractMainBody(lines: string[]): string[] {
-  // 找 int main() 或 void main() 所在行
+  // 找 main 函数起始行（C: int/void main; Java: public static void main / static void main）
   let mainStart = -1;
   for (let i = 0; i < lines.length; i++) {
-    if (/\b(?:int|void)\s+main\s*\(/.test(lines[i])) {
+    if (/\b(?:public\s+static\s+|static\s+)?(?:int|void)\s+main\s*\(/.test(lines[i])) {
       mainStart = i;
       break;
     }
   }
   if (mainStart === -1) return lines;
 
-  // 从 mainStart 行开始，找匹配的 {
+  // 从 mainStart 行开始，找匹配的 { 与 }
   let braceDepth = 0;
   let started = false;
-  let bodyStart = -1;
   for (let i = mainStart; i < lines.length; i++) {
     for (const ch of lines[i]) {
-      if (ch === "{") { braceDepth++; if (!started) { started = true; bodyStart = i; } }
+      if (ch === "{") { braceDepth++; if (!started) started = true; }
       else if (ch === "}") braceDepth--;
     }
     if (started && braceDepth <= 0) {
-      // body 是 mainStart 行的 { 之后 到 i 行的 } 之前
       const afterOpen = lines[mainStart].slice(lines[mainStart].indexOf("{") + 1);
       const body: string[] = [];
       if (afterOpen.trim()) body.push(afterOpen);
       for (let j = mainStart + 1; j < i; j++) body.push(lines[j]);
       const beforeClose = lines[i].slice(0, lines[i].lastIndexOf("}"));
       if (beforeClose.trim()) body.push(beforeClose);
-      // 保留 main 之前的行（全局声明等）+ main 体
-      return [...lines.slice(0, mainStart), ...body, ...lines.slice(i + 1)];
+      // 仅保留 main 之前的「全局」行（去掉类/import/package/using/# 包裹），
+      // 丢弃 main 之后的内容（如 Java 类的闭合 }），避免游离大括号破坏块结构
+      const skipWrap = /^\s*(class\s|public\s+class|import\s|package\s|using\s|#)/;
+      const before = lines.slice(0, mainStart).filter((l) => !skipWrap.test(l));
+      return [...before, ...body];
     }
   }
   return lines;

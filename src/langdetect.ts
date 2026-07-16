@@ -11,7 +11,7 @@ export function detectLanguage(code: string): Lang | "unknown" {
   const c = code;
   // 1) C/C++ 强信号
   if (
-    /(^|\s)#include\b|int\s+main\s*\(|printf\s*\(|scanf\s*\(|malloc\s*\(|calloc\s*\(|\bstd::|cout\s*<<|using\s+namespace|->\s*\w|struct\s+\w+\s*\{/.test(c)
+    /(^|\s)#include\b|int\s+main\s*\(|printf\s*\(|scanf\s*\(|malloc\s*\(|calloc\s*\(|\bstd::|cout\s*<<|cin\s*>>|using\s+namespace|->\s*\w|struct\s+\w+\s*\{|\bvector\s*</.test(c)
   ) {
     return "cpp";
   }
