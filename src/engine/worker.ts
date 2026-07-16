@@ -40,8 +40,10 @@ ctx.onmessage = (e: MessageEvent<RunRequest>) => {
     // 把插桩后的 JS 包进一个函数，注入运行时 API。
     // 用户代码已全部用 var 声明，故无 TDZ 问题；所有语句都在同一函数作用域内。
     // 注入 print 作为安全空函数，避免 Python 的 print(...) 在行内/同行 for 体里未定义而崩溃。
-    const fn = new Function("CVS", "CVN", "CVfn", "CVfi", "CVfe", "print", js);
-    fn(rt.CVS, CVN, CVfn, CVfi, CVfe, () => {});
+    // 注入常用数学辅助，避免 max/min/abs/pow 等被当成未定义而崩溃。
+    const preamble = "var print=function(){},max=Math.max,min=Math.min,abs=Math.abs,pow=Math.pow,sqrt=Math.sqrt,floor=Math.floor,ceil=Math.ceil,round=Math.round,PI=Math.PI,E=Math.E;";
+    const fn = new Function("CVS", "CVN", "CVfn", "CVfi", "CVfe", preamble + js);
+    fn(rt.CVS, CVN, CVfn, CVfi, CVfe);
     const finished = rt.finish() as TraceResult;
     // 推断整体结构类型：取出现频次最高的非数组结构，否则 array。
     const kindCount: Record<string, number> = {};

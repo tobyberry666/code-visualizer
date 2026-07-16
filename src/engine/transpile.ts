@@ -199,24 +199,37 @@ function pythonToJSish(srcLines: string[]): { lines: string[]; nodeClasses: Set<
       const cls = line.match(/^class\s+(\w+)/);
       if (cls) nodeClasses.add(cls[1]);
       skipDepth = indentStack.length > 0 ? indentStack[indentStack.length - 1] : 0;
-      out.push("/* " + line + " (skipped) */");
+      out.push("/* def/class skipped */");
       continue;
     }
     if (skipDepth !== -1 && indent >= skipDepth) {
-      out.push("/* skipped: " + line + " */");
+      out.push("/* skipped */");
       continue;
     }
 
     let s = line;
     // 0) f-string 先转，避免 {expr} 被后续括号统计误伤
     s = convertFString(s);
-    // 1) 字典/集合字面量（必须在 range/for 之前处理，避免 { } 被当成块）
+    // 1) 浅层字面量 / 推导式保护：嵌套花括号或含 for 的推导式整行跳过并声明左侧变量，
+    //    避免产生非法 JS。正常单层字典/集合仍正常转换。
+    const assignLhs = s.match(/^([A-Za-z_$][\w$]*)\s*=/);
+    if (assignLhs) {
+      if (/=\s*\[[^\]]*\bfor\b/.test(s)) {
+        out.push("var " + assignLhs[1] + "; /* listcomp skipped */");
+        continue;
+      }
+      if (/=\s*\{[^}]*\{/.test(s)) {
+        out.push("var " + assignLhs[1] + "; /* nested brace skipped */");
+        continue;
+      }
+    }
+    // 2) 字典/集合字面量（必须在 range/for 之前处理，避免 { } 被当成块）
     //    字典 {k: v, ...} -> 对象；集合 {a, b, ...} -> new Set([...])
     s = s.replace(/=\s*\{([^}]*:[^}]*)\}/g, "= ({$1})");
     s = s.replace(/=\s*\{([^}]*)\}/g, "= new Set([$1])");
-    // 2) 推导式（集合/字典）暂不展开，整行跳过以免产生非法 JS
+    // 3) 推导式（集合/字典）暂不展开，整行跳过以免产生非法 JS
     if (/\bfor\b.*\bin\b/.test(s) && /[{}]/.test(s)) {
-      out.push("/* comprehension skipped: " + line + " */");
+      out.push("/* comprehension skipped */");
       continue;
     }
     // 内置翻译
@@ -306,34 +319,98 @@ function balanceBraces(lines: string[]): string[] {
 
 // ---------------- C-family 归一化 ----------------
 
-function normCFamilyLine(line: string, nodeClasses: Set<string>): string {
+/** 把嵌套的容器模板参数剥离：vector<vector<int>> -> vector，map<string,int> -> map。
+ *  只匹配已知容器名，避免误伤比较表达式里的 < / >。 */
+const CONTAINERS = "vector|list|map|set|deque|stack|queue|priority_queue|pair|array|multimap|multiset|unordered_map|unordered_set|unordered_multimap|unordered_multiset|forward_list|tuple";
+function stripContainerTemplates(s: string): string {
+  let out = s;
+  // 反复剥离最内层模板参数 <...>，处理嵌套如 vector<pair<int,int>>
+  // 仅当 < 前是标识符或 >（嵌套闭合）才剥离，避免误伤 << 流输出 / -> 箭头
+  for (let i = 0; i < 8; i++) {
+    const next = out.replace(/(?<=[\w>])<[^<>]*>/g, "");
+    if (next === out) break;
+    out = next;
+  }
+  return out;
+}
+
+function normCFamilyLine(line: string, lang: Lang, nodeClasses: Set<string>): string {
   let s = line;
   if (s.trim() === "") return s;
 
-  // return / delete / exit → 整行清除（可视化不需要）—— 放在最前面确保清除
-  if (/^\s*return\b/.test(s) || /^\s*delete\s+\w/.test(s) || /^\s*exit\s*\(/.test(s)) return "";
+  // JavaScript 已是合法 JS，直接返回，避免 C/Java 类型词（如 double/char）误伤标识符/对象键
+  if (lang === "javascript") return s;
 
-  // 预处理指令（#include/#define/#ifdef 等）整行跳过
-  s = s.replace(/^\s*#\w+.*$/g, "/* pp skipped */");
-  // using namespace std; 整行跳过
-  s = s.replace(/^\s*using\b.*$/g, "/* using skipped */");
-  // Java import / package 整行跳过
-  s = s.replace(/^\s*import\b.*$/g, "/* import skipped */");
-  s = s.replace(/^\s*package\b.*$/g, "/* package skipped */");
-  // Java class 声明行（含 extends/implements）整行跳过，避免类包裹的 { } 干扰块结构
-  s = s.replace(/^\s*(?:public\s+|final\s+|abstract\s+|static\s+)*class\s+[\w<>,.\s]*\{?\s*$/g, "/* class skipped */");
+  // 1) 容器嵌套模板先剥离：vector<vector<int>> -> vector（只匹配已知容器名，避免误伤比较表达式）
+  s = stripContainerTemplates(s);
+  // 2) 剥掉 C++ 命名空间前缀 / endl
+  s = s.replace(/std::/g, "");
+  s = s.replace(/\bendl\b/g, "");
 
-  // 跳过整行结构体/类/联合定义（教学子集不展开成员，避免把成员当语句执行）
-  s = s.replace(/^\s*(?:typedef\s+)?(?:struct|class|union)\s+\w*\s*\{[^}]*\}\s*\w*\s*;?\s*$/, "/* struct skipped */");
-  // 去掉 C 风格类型强转 (Type*) / (Type) / (struct X*)
+  // 3) 预处理/using/import/package/class 包裹整行跳过（避免游离大括号）
+  if (/^\s*#\w+.*$/g.test(s)) return "/* pp skipped */";
+  if (/^\s*using\b.*$/g.test(s)) return "/* using skipped */";
+  if (/^\s*import\b.*$/g.test(s)) return "/* import skipped */";
+  if (/^\s*package\b.*$/g.test(s)) return "/* package skipped */";
+  if (/^\s*(?:public\s+|final\s+|abstract\s+|static\s+)*class\s+[\w<>,.\s]*\{?\s*$/g.test(s)) return "/* class skipped */";
+  if (/^\s*(?:typedef\s+)?(?:struct|class|union)\s+\w*\s*\{[^}]*\}\s*\w*\s*;?\s*$/.test(s)) return "/* struct skipped */";
+
+  // 4) exit -> 空语句（不要清空整行，以免控制结构大括号失衡）
+  if (/^\s*exit\s*\(/.test(s)) return ";";
+
+  // 5) I/O 与 delete/free：替换为空语句 ";"（保留大括号平衡），而不是清空整行。
+  //    关键：原 for(...) cout<<...; 这类「循环体即一条 I/O」会变成 for(...) ; 仍然合法。
+  s = s.replace(/std::cout\s*<<[^;]*;?/g, ";");
+  s = s.replace(/System\.out\.print(ln)?\s*\([^;]*\)\s*;?/g, ";");
+  s = s.replace(/cout\s*<<[^;]*;?/g, ";");
+  s = s.replace(/printf\s*\([^;]*\)\s*;?/g, ";");
+  s = s.replace(/Console\.WriteLine\s*\([^;]*\)\s*;?/g, ";");
+  s = s.replace(/\bprintln\s*\([^;]*\)\s*;?/g, ";");
+  s = s.replace(/\bgets\s*\([^;]*\)\s*;?/g, ";");
+  s = s.replace(/\bputs\s*\([^;]*\)\s*;?/g, ";");
+  s = s.replace(/\bdelete\s+\w+\s*;?/g, ";");
+  s = s.replace(/\bfree\s*\([^)]*\)\s*;?/g, ";");
+  // cin >> x; -> x = 5;（可视化给默认输入）
+  s = s.replace(/cin\s*>>\s*([^;]*);?/g, (_m, vars) =>
+    vars.split(">>").map((v: string) => v.trim().replace(/^&?/, "") + " = 5").join("; ") + ";");
+  // scanf -> 给变量赋默认值
+  s = s.replace(/scanf\s*\([^)]*\)\s*;?/g, (_m) => {
+    const args = _m.match(/scanf\s*\(([^)]+)\)/);
+    if (!args) return ";";
+    const parts = args[1].split(",").slice(1).map((a: string) => a.trim().replace(/^&/, ""));
+    return parts.map((v: string) => `${v} = 5`).join("; ") + ";";
+  });
+
+  // 6) Java 数组返回类型 / 形参里的 []：int[] foo / int[] x -> 去掉 int[]（后续标量规则处理）
+  s = s.replace(/\b(?:int|long|double|float|char|byte|short|boolean|String|void)\s*\[\s*\]/g, "");
+  // 6b) Java 数组构造 new int[]{…} -> […]，以及剥离 int[] 后残留的 new {…} -> […]
+  s = s.replace(new RegExp("\\bnew\\s*(?:" + TYPE_WORDS.join("|") + ")\\s*\\[\\s*\\]\\s*\\{([^}]*)\\}"), "[$1]");
+  s = s.replace(/\bnew\s*\{([^}]*)\}/g, "[$1]");
+
+  // 7) swap(a, b) -> 临时变量交换（否则未定义报错）
+  s = s.replace(/swap\s*\(([^)]*)\)/g, (_m, args) => {
+    const [a, b] = args.split(",").map((x: string) => x.trim());
+    if (!a || !b) return ";";
+    const t = "__cvt" + Math.random().toString(36).slice(2, 7);
+    return `var ${t} = ${a}; ${a} = ${b}; ${b} = ${t};`;
+  });
+
+  // 8) sort(x.begin(), x.end(), cmp) -> x.sort(cmp)；sort(x.begin(), x.end()) -> x.sort()
+  s = s.replace(/(\w+)\.begin\(\)/g, "$1");
+  s = s.replace(/(\w+)\.end\(\)/g, "$1");
+  s = s.replace(/(?<!\.)\bsort\s*\(\s*([^,]+?)\s*,\s*[^,]+?(?:,\s*([^)]*))?\)/g, (_m, arr, cmp) =>
+    cmp ? `${arr.trim()}.sort(${cmp.trim()})` : `${arr.trim()}.sort()`);
+  // C++ lambda [] (...) { ... } -> function(...) { ... }（使整体可解析）
+  s = s.replace(/\[\]\s*\(([^)]*)\)\s*\{/g, "function($1) {");
+
+  // 9) C 风格类型强转 (Type*) / (Type)
   s = s.replace(/\(\s*(?:struct\s+)?[A-Z]\w*(?:\s*\*+)?\s*\)/g, "");
+  s = s.replace(/\(\s*(?:int|float|double|char|long|short|bool|boolean|void|size_t|uint\w+_t)\s*\)/g, "");
 
-  // 逗号分隔声明拆分：int n, m; → int n; int m;
-  // 匹配 TYPE *? var1, *? var2, *? var3;
+  // 10) 逗号分隔声明拆分：int n, m; -> int n; int m;
   s = s.replace(
     new RegExp("^\\s*(?:" + TYPE_WORDS.join("|") + ")\\b\\s*[&*]?\\s*\\w+(?:\\s*,\\s*[&*]?\\w+)+\\s*;\\s*$"),
     (m) => {
-      // 提取类型和变量列表
       const parts = m.trim().replace(/;$/, "").split(/(?<=\w)\s*,\s*/);
       const typePart = parts[0].replace(/\s*[&*]?\s*\w+\s*$/, "").trim();
       return parts.map(p => {
@@ -342,37 +419,56 @@ function normCFamilyLine(line: string, nodeClasses: Set<string>): string {
       }).join("\n");
     }
   );
-  // 小写自定义类型逗号声明：node *head, *p, *now; → var head; var p; var now;
+  // 小写自定义类型逗号声明：node *head, *p; -> var head; var p;（容器名跳过，交给规则13）
   s = s.replace(
     /^\s*([a-z]\w+)\s+(\*?\s*\w+(?:\s*,\s*\*?\s*\w+)+)\s*;\s*$/,
     (_m, _type, vars) => {
+      if (new RegExp("^(?:" + CONTAINERS + ")$").test(_type)) return _m;
       return vars.split(/,\s*/).map((v: string) => "var " + v.replace(/^\*?\s*/, "").trim() + ";").join("\n");
     }
   );
-  // 小写自定义类型单变量指针：node *head; → var head;
+  // 小写自定义类型单变量指针：node *head; -> var head;（容器名跳过，交给规则13）
   s = s.replace(/^\s*([a-z]\w+)\s*\*\s*(\w+)\s*[=;]/, (_m, tp, v) => {
-    if (TYPE_WORDS.includes(tp) || /^(?:let|var|const|if|else|for|while|do|switch|case|return|break|continue|function|class|new|delete|typeof|instanceof|void|throw|try|catch|finally)$/.test(tp)) return _m;
+    if (TYPE_WORDS.includes(tp) || /^(?:let|var|const|if|else|for|while|do|switch|case|return|break|continue|function|class|new|delete|typeof|instanceof|void|throw|try|catch|finally)$/.test(tp) || new RegExp("^(?:" + CONTAINERS + ")$").test(tp)) return _m;
     return "var " + v + ";";
   });
-  // 小写自定义类型无指针：node head; → var head;
+  // 小写自定义类型无指针：node head; -> var head;（容器名跳过，交给规则13）
   s = s.replace(/^\s*([a-z]\w+)\s+(\w+)\s*[=;]/, (_m, tp, v) => {
-    if (TYPE_WORDS.includes(tp) || /^(?:let|var|const|if|else|for|while|do|switch|case|return|break|continue|function|class|new|delete|typeof|instanceof|void|throw|try|catch|finally)$/.test(tp)) return _m;
+    if (TYPE_WORDS.includes(tp) || /^(?:let|var|const|if|else|for|while|do|switch|case|return|break|continue|function|class|new|delete|typeof|instanceof|void|throw|try|catch|finally)$/.test(tp) || new RegExp("^(?:" + CONTAINERS + ")$").test(tp)) return _m;
     return "var " + v + ";";
   });
 
-  // 函数定义
+  // 11) 函数定义（允许修饰符 public/static、Java 数组返回类型、引用形参 &；返回类型可缺省，但需有修饰符或类型）
   s = s.replace(
-    new RegExp("\\b(?:" + TYPE_WORDS.join("|") + "|struct\\s+\\w+)s*\\*?\\s*([A-Za-z_$][\\w$]*)\\s*\\(([^)]*)\\)\\s*\\{?"),
+    new RegExp("\\b(?:(?:(?:public|private|protected|static|final|const|virtual|inline|explicit|override|constexpr)\\s+)+\\s*(?:(?:" + TYPE_WORDS.join("|") + "|struct\\s+\\w+)\\s*)?|(?:(?:" + TYPE_WORDS.join("|") + "|struct\\s+\\w+)\\s*))\\*?\\s*\\[?\\]?\\s*([A-Za-z_$][\\w$]*)\\s*\\(([^)]*)\\)\\s*\\{?"),
     (_m, name, params) => {
-      const ps = params.split(",").map((p: string) => p.replace(new RegExp("(?:" + TYPE_WORDS.join("|") + ")"), "").replace(/[&*]+/g, "").replace(/\[\s*\]/g, "").replace(/=.*$/, "").trim()).filter(Boolean).join(", ");
+      const ps = params.split(",").map((p: string) => p
+        .replace(new RegExp("(?:" + TYPE_WORDS.join("|") + ")"), "")
+        .replace(new RegExp("(?:" + CONTAINERS + ")\\b"), "")
+        .replace(/\b[A-Z]\w*\b/g, "")
+        .replace(/\[\s*\]/g, "")
+        .replace(/[&*]+/g, "")
+        .replace(/=.*$/, "")
+        .trim()).filter(Boolean).join(", ");
       return `function ${name}(${ps}) {`;
     }
   );
 
-  // 数组字面量声明
+  // 11b) 清洗已生成 function(...) 的形参类型（如 lambda function( a, int b) -> function(a, b)）
+  s = s.replace(/function\s*\(([^)]*)\)/g, (_m, params) => {
+    const ps = params.split(",").map((p: string) => p
+      .replace(new RegExp("(?:" + TYPE_WORDS.join("|") + ")"), "")
+      .replace(/\b[A-Z]\w*\b/g, "")
+      .replace(/\[\s*\]/g, "")
+      .replace(/[&*]+/g, "")
+      .replace(/=.*$/, "")
+      .trim()).filter(Boolean).join(", ");
+    return `function(${ps})`;
+  });
+
+  // 12) 数组字面量声明
   s = s.replace(/\b\w+\s*\[\s*\]\s*(\w+)\s*=\s*\{([^}]*)\}/g, "var $1 = [$2]");
   s = s.replace(/\b\w+\s+(\w+)\s*\[\s*\]\s*=\s*\{([^}]*)\}/g, "var $1 = [$2]");
-  // 无类型前缀的数组声明：arr[5] = {1,2,3}; -> arr = [1,2,3];
   s = s.replace(/\b([A-Za-z_]\w*)\s*\[\s*\w*\s*\]\s*=\s*\{([^}]*)\}/g, "$1 = [$2]");
   s = s.replace(/new\s+\w+\s*\[\s*\]\s*\{([^}]*)\}/g, "[$1]");
   // 二维数组字面量：int adj[3][3] = { {0,1,1}, ... } -> var adj = [[0,1,1], ...]
@@ -385,7 +481,34 @@ function normCFamilyLine(line: string, nodeClasses: Set<string>): string {
   );
   // new TYPE[n] -> new Array(n).fill(0)
   s = s.replace(/\bnew\s+\w+\s*\[\s*([^\]]*)\s*\]\s*\(?([^;]*?)\)?\s*(?:;|$)/g, "new Array($1).fill(0)");
-  // 大写类型 + 指针声明：Node* head = -> var head =
+
+  // 13) 容器声明（模板已剥离，余下 vector v / map m / set s 等）
+  s = s.replace(/\b(set|multiset|unordered_set)\s+([A-Za-z_$][\w$]*)\s*=\s*\{([^}]*)\}/g, "var $2 = new Set([$3])");
+  s = s.replace(/\b(map|multimap|unordered_map|unordered_multimap)\s+([A-Za-z_$][\w$]*)\s*[=;]/g, "var $2 = new Map()");
+  s = s.replace(new RegExp("\\b(?:" + CONTAINERS + ")\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*\\{([^}]*)\\}"), "var $1 = [$2]");
+  s = s.replace(new RegExp("\\b(?:" + CONTAINERS + ")\\s+([A-Za-z_$][\\w$]*)\\s*[=;]"), "var $1 = [];");
+  // 13b) 容器构造调用：vector<vector<int>> adj(n); -> var adj = Array.from({length:n},()=>[])
+  s = s.replace(new RegExp("\\b(?:" + CONTAINERS + ")\\s+([A-Za-z_$][\\w$]*)\\s*\\(([^)]*)\\)"), "var $1 = Array.from({length: ($2)}, () => [])");
+  // 容器成员方法：push_back -> push
+  s = s.replace(/\.push_back\(/g, ".push(");
+  // 13d) 裸初始化：int[] a = {…} 经规则6剥离 int[] 后剩 a = {…} -> var a = […]
+  s = s.replace(/^\s*([A-Za-z_$][\w$]*)\s*=\s*\{([^}:]*)\}\s*;?\s*$/g, "var $1 = [$2];");
+  // 13e) C++ 花括号初始化（pair/tuple）：push_back({1,2}) -> push([1,2])；x = {1,2} -> x = [1,2]（不含冒号，避免误伤对象字面量）
+  s = s.replace(/\.(?:push_back|push|emplace_back)\s*\(\s*\{([^{}:]*)\}\s*\)/g, ".push([$1])");
+  s = s.replace(/=\s*\{([^{}:]*)\}/g, "= [$1]");
+  // 13c) Java 集合：new HashMap<>() -> new Map()；HashSet/.../ArrayList/... -> []（统一用数组 + push）
+  // 模板参数可能已被 stripContainerTemplates 剥离为 new X()，故 <[^>]*> 设为可选
+  s = s.replace(/new\s+(?:HashMap|TreeMap|LinkedHashMap|ConcurrentHashMap)(?:\s*<[^>]*>)?\s*\(\s*\)/g, "new Map()");
+  s = s.replace(/new\s+(?:HashSet|TreeSet|LinkedHashSet|ArrayList|LinkedList|Vector|Stack|ArrayDeque)(?:\s*<[^>]*>)?\s*\(\s*\)/g, "[]");
+  // Java 泛型擦除：HashMap<Integer,Integer> map -> HashMap map（仅大写类型名后跟 <...>）
+  s = s.replace(/\b([A-Z]\w*)\s*<[^<>]*>\s*/g, "$1 ");
+  // Java 集合方法：containsKey -> has；put -> set；add -> push（统一转到 JS 数组）
+  s = s.replace(/\.containsKey\s*\(/g, ".has(");
+  s = s.replace(/\.put\s*\(/g, ".set(");
+  s = s.replace(/\.add\s*\(/g, ".push(");
+  // 注意：不再 blanket 剥离容器名，否则会把名为 map/set 的变量也吃掉（如 java_twosum）
+
+  // 14) 大写类型 + 指针声明：Node* head = -> var head =
   s = s.replace(/\b([A-Z]\w*)\s*\*+\s*([A-Za-z_$][\w$]*)\s*(=|;)/g, "var $2 $3");
   // 指针/引用声明 int* p; -> var p;
   s = s.replace(new RegExp("\\b(?:" + TYPE_WORDS.join("|") + ")\\b\\s*\\*+\\s*(\\w+)\\s*;"), "var $1;");
@@ -393,25 +516,13 @@ function normCFamilyLine(line: string, nodeClasses: Set<string>): string {
   s = s.replace(new RegExp("\\b(?:const|final|static|unsigned|signed)?\\s*(?:" + TYPE_WORDS.join("|") + ")\\b\\s*[&*]?\\s*(\\w+)\\s*="), "var $1 =");
   // 标量声明无初始化（含引用 &）
   s = s.replace(new RegExp("\\b(?:" + TYPE_WORDS.join("|") + ")\\b\\s*[&*]?\\s*(\\w+)\\s*;"), "var $1;");
-  // 大写自定义类型作声明：Node head = -> var head =（避免把类型名当语句执行）
+  // 大写自定义类型作声明：Node head = -> var head =
   s = s.replace(/\b([A-Z]\w*)\s+([A-Za-z_$][\w$]*)\s*=/g, "var $2 =");
 
-  // & 地址符（scanf/函数参数中的 &var -> var）
+  // 15) & 地址符
   s = s.replace(/&([A-Za-z_$][\w$]*)/g, "$1");
 
-  // 标准库容器类型（vector/map/set/...）声明：剥离 <...> 并给合理初值，避免留下 vector<> 这类非法片段
-  s = s.replace(/\b(?:vector|list|deque|forward_list)\s*<[^>]*>\s*(\w+)\s*=\s*\{([^}]*)\}/g, "var $1 = [$2]");
-  s = s.replace(/\b(?:vector|list|deque|forward_list)\s*<[^>]*>\s*(\w+)\s*\(([^)]*)\)/g, "var $1 = new Array($2 || 0).fill(0)");
-  s = s.replace(/\b(?:vector|list|deque|forward_list)\s*<[^>]*>\s*(\w+)\s*[=;]/g, "var $1 = []");
-  s = s.replace(/\b(?:map|multimap|unordered_map)\s*<[^>]*>\s*(\w+)\s*=\s*\{([^}]*)\}/g, "var $1 = {$2}");
-  s = s.replace(/\b(?:map|multimap|unordered_map|set|multiset|unordered_set|stack|queue|priority_queue)\s*<[^>]*>\s*(\w+)\s*[=;]/g, "var $1 = {}");
-  // 通用容器类型（首字母大写，Java 风格）
-  s = s.replace(/\b(?:ArrayList|List|Set|Map|Deque|Queue|Stack|HashMap|Vector|PriorityQueue|LinkedList)\s*<[^>]*>\s*/g, "");
-  s = s.replace(/\b[A-Z]\w*\s*<[^>]*>\s*/g, "");
-  s = s.replace(/vector\s*<[^>]*>\s*(\w+)\s*\(([^)]*)\)/g, "var $1 = new Array($2 || 0).fill(0)");
-  s = s.replace(/vector\s*<[^>]*>\s*(\w+)\s*;/g, "var $1 = []");
-
-  // 指针与结构体
+  // 16) 指针与结构体
   s = s.replace(/\bstruct\s+/g, "");
   s = s.replace(/\bNULL\b/g, "null");
   s = s.replace(/\bnullptr\b/g, "null");
@@ -419,50 +530,30 @@ function normCFamilyLine(line: string, nodeClasses: Set<string>): string {
   s = s.replace(/\(\s*\*(\w+)\s*\)/g, "$1");
   s = s.replace(/(^|[^*/\w])\*\s*(\w+)\s*=/g, "$1$2 =");
 
-  // 输出/输入语句
-  s = s.replace(/System\.out\.print(ln)?\s*\([^;]*\)\s*;?/g, "");
-  s = s.replace(/cout\s*<<[^;]*;?/g, "");
-  s = s.replace(/printf\s*\([^;]*\)\s*;?/g, "");
-  // scanf → 提取变量名并赋默认值
-  s = s.replace(/scanf\s*\([^)]*\)\s*;?/g, (_m) => {
-    const args = _m.match(/scanf\s*\(([^)]+)\)/);
-    if (!args) return "";
-    const parts = args[1].split(",").slice(1).map((a: string) => a.trim().replace(/^&/, ""));
-    return parts.map((v: string) => `${v} = 5`).join("; ") + ";";
-  });
-  s = s.replace(/Console\.WriteLine\s*\([^;]*\)\s*;?/g, "");
-  s = s.replace(/\bprintln\s*\([^;]*\)\s*;?/g, "");
-  s = s.replace(/\bgets\s*\([^;]*\)\s*;?/g, "");
-  s = s.replace(/\bputs\s*\([^;]*\)\s*;?/g, "");
-
-  // delete / free -> 空
-  s = s.replace(/\bdelete\s+\w+\s*;?/g, "");
-  s = s.replace(/\bfree\s*\([^)]*\)\s*;?/g, "");
-
-  // 内存分配 -> 节点工厂
+  // 17) 内存分配 -> 节点工厂
   s = s.replace(/sizeof\s*\([^)]*\)/g, "0");
   s = s.replace(/malloc\s*\(.*?\)/g, "CVN(undefined, {next:null,left:null,right:null})");
   s = s.replace(/calloc\s*\(.*?\)/g, "CVN(undefined, {next:null,left:null,right:null})");
 
-  // 节点构造
+  // 18) 节点构造
   s = convertNodeCalls(s, nodeClasses);
-  // new TypeName（无括号）→ CVN(undefined, ...)
   s = s.replace(/\bnew\s+([A-Z]\w+)\s*[;=]/g, "CVN(undefined, {next:null,left:null,right:null})");
   s = s.replace(/\bnew\s+([a-z]\w+)\s*[;=]/g, (_m, name) => {
     return nodeClasses.has(name) ? `CVN(undefined, {next:null,left:null,right:null})` : _m;
   });
-  // 去掉 new 关键字（CVN 已是普通工厂函数）
-  s = s.replace(/\bnew\s+/g, "");
+  // 仅剥离 C++ 风格 new（如 new Node(...)），保留 JS 内置构造（new Set/Map/Array/...）
+  s = s.replace(/\bnew\s+(?!Set|Map|Array|Date|Promise|RegExp|Error|Object|WeakMap|WeakSet)(?=[A-Za-z_$])/g, "");
 
-  // for 头
+  // 19) for 头
   s = s.replace(/for\s*\(\s*(?:int|float|double|char|long|short|bool|boolean|auto|const|let|var)\s+/g, "for (var ");
   s = s.replace(/for\s*\([^)]*?:\s*([^)]+)\)/g, (_m, iter) => {
     const inner = _m.match(/\(([^:]+):/);
-    const varPart = inner ? inner[1].replace(new RegExp("(?:" + TYPE_WORDS.join("|") + ")"), "").replace(/\*+/g, "").replace(/^\s*(?:const|let|var)\s*/, "").trim() : "x";
+    let varPart = inner ? inner[1].replace(new RegExp("(?:" + TYPE_WORDS.join("|") + ")"), "").replace(/\*+/g, "").replace(/&/g, "").replace(/^\s*(?:const|let|var)\s*/, "").trim() : "x";
+    if (!varPart) varPart = "x";
     return `for (var ${varPart} of ${iter.trim()})`;
   });
 
-  // 兜底：去掉残留的 C++ 关键字（public/private/... 已在下面统一处理）
+  // 20) 兜底关键字
   s = s.replace(/\b(public|private|protected|static|final|virtual|inline|unsigned|signed|register|volatile|constexpr|override|explicit|friend|typedef|using)\b/g, " ");
   // 兜底：残留的 TYPE var / TYPE *var / TYPE &var 声明 → var
   s = s.replace(new RegExp("\\b(?:" + TYPE_WORDS.join("|") + ")\\b\\s*[&*]?\\s*(\\w+)\\s*([=;])"), "var $1 $2");
@@ -556,7 +647,7 @@ export function transpile(code: string, lang: Lang): { js: string; nodeClasses: 
       }
       const collapsed = collapseMultilineDefs(stripped);
       const mainExtracted = extractMainBody(collapsed);
-      const norm = mainExtracted.map((l) => normCFamilyLine(l, nodeClasses));
+      const norm = mainExtracted.map((l) => normCFamilyLine(l, lang, nodeClasses));
       // normCFamilyLine 可能返回多行（逗号声明拆分），需展开为独立行
       const flat: string[] = [];
       for (const l of norm) {
@@ -566,8 +657,11 @@ export function transpile(code: string, lang: Lang): { js: string; nodeClasses: 
           flat.push(l);
         }
       }
+      // 大括号兜底：归一化可能仍残留开括号失衡（例如被剥离的循环体），
+      // 这里按字符串统计补齐缺失的闭合 }，避免 new Function 报 Unexpected token。
+      const balanced = balanceBraces(flat);
       const names = collectNames(stripped);
-      const js = instrument(flat, names);
+      const js = instrument(balanced, names);
       return { js, nodeClasses, error: undefined };
     }
   } catch (e: any) {
