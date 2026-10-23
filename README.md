@@ -1,4 +1,4 @@
-# Code Visualier
+# Code Visualizer
 
 中文友好 · 丝滑动画 · 粘贴代码自动识别语言并可视化的在线平台。
 
